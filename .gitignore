@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+data/*.db
+data/*.db-shm
+data/*.db-wal
+coverage/
+.DS_Store
+npm-debug.log*
