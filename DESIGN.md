@@ -75,7 +75,7 @@ sequenceDiagram
   G->>DB: Persist request log
   G->>DB: Check rate limit and cache
   G->>R: Build allowed provider candidates
-  R-->>G: Cheapest configured provider first
+  R-->>G: Real configured candidates sorted by estimated cost
   G->>DB: Reserve estimated budget
   G->>E: Execute provider attempt
   E->>DB: Read circuit state and failure injection
@@ -95,13 +95,19 @@ SQLite is the local source of truth. It stores tenants, API key hashes, provider
 
 The provider layer includes real OpenAI, Anthropic, and Google Gemini adapters plus mock OpenAI and mock Anthropic adapters. The mock providers make local tests, demos, and failure injection deterministic and free. Real providers are considered configured only when their API keys exist in the environment. Normal routing prefers configured real providers; if no real provider is configured, it falls back to mock providers so the assignment can still be evaluated without spend. A client can also explicitly request a mock provider for local failure-injection demos.
 
+The gateway does not wrap LiteLLM, OpenRouter, Portkey, Helicone, or another off-the-shelf gateway. Those products are useful references, but this implementation keeps provider mapping, routing, retries, circuit breakers, accounting, caching, and failure injection inside the codebase so the tradeoffs are visible.
+
 ## 3. Key Decisions And Tradeoffs
 
 The first major choice was TypeScript with Express. The JD asks for MERN-style backend strength and Node.js/Express experience. A heavier framework would add conventions that do not matter for this assignment. Express keeps the HTTP layer obvious, and TypeScript gives type safety where it helps: provider contracts, domain types, schema mapping, and service boundaries.
 
+Provider integration is implemented with direct adapters rather than an aggregator. OpenAI, Anthropic, and Gemini have different authentication, message, response, and streaming shapes. Keeping one adapter per provider makes those differences explicit while preserving one client-facing API. The tradeoff is more code to maintain than using a managed gateway, but that is also the point of this assignment: provider behavior, failure handling, and accounting are not hidden behind a third-party abstraction.
+
 SQLite was chosen over MongoDB for the assignment build. MongoDB would align with the JD, but this gateway needs atomic budget updates, request accounting, and transactional ledger writes. SQLite gives simple local setup and SQL constraints without requiring Docker or an external service. The tradeoff is that SQLite is not the production answer for horizontally scaled gateway workers. The production path would move to Postgres for row-level locking, connection pooling, stronger migrations, and better analytical queries.
 
 The routing policy is cost-optimized routing with failover. If a tenant does not request a provider, the gateway builds allowed and configured candidates, prefers real configured providers when any are available, estimates cost from prompt size and max tokens, then chooses the cheapest candidate. If no real provider is configured, the same policy runs against local mock providers. If the first candidate fails before a non-streaming response is returned, the gateway refunds the budget reservation and tries the next candidate. This is intentionally simple but non-trivial: it proves provider abstraction, tenant allowlists, cost awareness, and graceful fallback. A production system would add latency-weighted routing and per-model quality tiers.
+
+The request path is synchronous. The gateway reserves budget, calls the provider, records usage, and returns the response in the same request lifecycle. That makes behavior easy to evaluate and avoids hiding failure behind background jobs. I did not add queue workers for this assignment because the core requirement is an online gateway, not an async batch processor. Production would still add workers for stale reservation reconciliation, analytics export, and provider health probes.
 
 Budget enforcement uses reservation plus adjustment. Before calling a provider, the gateway atomically reserves estimated maximum cost against the tenant budget. After the provider returns, it records actual usage and refunds or charges the delta. This prevents concurrent requests from overspending the same budget. The tradeoff is conservative rejection: a tenant near the budget cap may be rejected even though actual usage might have fit. For an assignment, correctness beats squeezing every last cent from the budget. Production could use finer token estimation and pre-paid reservation buckets.
 
@@ -110,6 +116,8 @@ Caching is tenant-scoped and only applies to non-streaming responses. The cache 
 Circuit breakers are per provider and persisted. After repeated provider failures, the circuit opens and later moves to half-open after a reset timeout. Keeping this in SQLite makes state inspectable and restart-safe for the assignment. In a horizontally scaled production deployment, circuit state would likely live in Redis or a control-plane store with careful tuning to avoid every worker stampeding an unhealthy provider at once.
 
 Failure injection is a first-class API because the assignment says evaluators will simulate failures. The gateway supports fail, timeout, slow, and stream-drop modes per provider. This is not a production admin API as-is; it exists to make evaluation pleasant and repeatable. A production version would put this behind strong admin auth or move it into test-only tooling.
+
+Observability is built from three layers. Structured JSON logs carry request IDs, tenant IDs, provider names, retry attempts, error codes, latency, token counts, and cost without logging prompts or secrets. Prometheus counters and histograms expose request rate, provider error rate, latency distributions, token usage, and cost, so p50/p95/p99 can be computed by Prometheus/Grafana from histogram buckets. SQLite request logs, provider attempts, token usage, and cost ledger rows provide the durable audit path for questions like "what did tenant X spend yesterday and on which model?"
 
 The deployment model supports direct `npm` commands, a Makefile, and Docker. Docker is intentionally a thin wrapper around the same Node process with SQLite stored in a volume; it does not introduce Postgres, Redis, Kafka, or a sidecar stack. That keeps clone-to-running time low while still proving the service can run in a repeatable container. The tradeoff is that the Docker Compose file is not a production topology. Production deployment would use a managed database, external cache or limiter, secret manager, dashboards, and proper rollout controls.
 
@@ -155,7 +163,7 @@ The fourth gap is load and soak testing. The code has integration tests for impo
 
 The fifth gap is production observability. The gateway emits useful metrics and logs, but there are no Grafana dashboards, alert rules, distributed traces, or on-call runbooks. Estimated effort: 2-4 days for dashboards, alerts, and incident docs.
 
-The Dockerfile is a local packaging convenience, not the final deployment story. A production container would need image scanning, pinned base image policy, non-root runtime checks, rollout health gates, resource limits, and cloud-specific secret injection. Estimated effort: 1-2 days for a pragmatic first deployment package after the target cloud is known.
+Additional deployment note: the Dockerfile is a local packaging convenience, not the final deployment story. A production container would need image scanning, pinned base image policy, non-root runtime checks, rollout health gates, resource limits, and cloud-specific secret injection. Estimated effort: 1-2 days for a pragmatic first deployment package after the target cloud is known.
 
 ## 7. Scaling Story
 
